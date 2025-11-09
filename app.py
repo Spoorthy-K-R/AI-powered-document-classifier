@@ -25,9 +25,12 @@ except Exception:
 # ==============================
 # Config (override via env vars)
 # ==============================
-OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-PRIMARY_MODEL    = os.getenv("PRIMARY_MODEL", "mistral:7b-instruct")
-VERIFIER_MODEL   = os.getenv("VERIFIER_MODEL", "llama3:8b")
+OPENROUTER_BASE   = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_APIKEY = os.getenv("OPENROUTER_API_KEY", "")
+# Use free-tier models by default (can be overridden)
+PRIMARY_MODEL     = os.getenv("PRIMARY_MODEL", "mistralai/mistral-7b-instruct")
+VERIFIER_MODEL    = os.getenv("VERIFIER_MODEL", "meta-llama/llama-3.1-8b-instruct")
+
 ENABLE_OCR       = os.getenv("ENABLE_OCR", "false").lower() == "true"
 STOP_EARLY       = os.getenv("STOP_EARLY", "true").lower() == "true"
 MAX_PAGE_CHARS   = int(os.getenv("MAX_PAGE_CHARS", "8000"))
@@ -36,6 +39,10 @@ MAX_PAGES        = int(os.getenv("MAX_PAGES", "0"))  # 0 = no cap
 LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
 # Where to persist HITL feedback (newline-delimited JSON)
 HITL_LOG = os.getenv("HITL_LOG", "hitl_feedback.jsonl")
+
+# Optional headers OpenRouter recommends (not required)
+OPENROUTER_SITE   = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP    = os.getenv("OPENROUTER_APP_NAME", "AI Document Classifier")
 
 # ==============================
 # Logging / request-scoped debug
@@ -88,41 +95,86 @@ def _extract_json(response_text: str) -> dict:
             return json.loads(txt[start:end+1])
         raise ValueError("No JSON object found in LLM response")
 
-def call_ollama(prompt: str, model: str, timeout: int = 120) -> dict:
-    """Use /api/generate; fall back to /api/chat when needed. Logs timings and status."""
-    gen_url  = f"{OLLAMA_HOST}/api/generate"
-    chat_url = f"{OLLAMA_HOST}/api/chat"
+def call_openrouter(prompt: str, model: str, timeout: int = 120) -> dict:
+    """
+    Robust OpenRouter caller:
+      1) Try /chat/completions (OpenAI-compatible).
+      2) On 404/405, fallback to /completions.
+      3) Always print error text when non-200.
+    """
+    base = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1").rstrip("/")
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
 
-    payload_generate = {
+    # Shared headers
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # Optional but useful for OpenRouter analytics/rate-limits attribution
+        "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "") or "http://localhost",
+        "X-Title": os.getenv("OPENROUTER_APP_NAME", "AI Document Classifier"),
+        "Accept": "application/json",
+    }
+
+    # ---------- Try Chat Completions first ----------
+    chat_url = f"{base}/chat/completions"
+    chat_payload = {
         "model": model,
-        "prompt": prompt,
-        "options": {"temperature": 0, "num_ctx": 6144},
-        "stream": False,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "You are a careful compliance analyst. Reply with STRICT JSON only."},
+            {"role": "user", "content": prompt}
+        ],
     }
 
     t0 = time.perf_counter()
-    r = requests.post(gen_url, json=payload_generate, timeout=timeout)
-    dt = round((time.perf_counter() - t0)*1000.0, 1)
-    _log_stage("ollama:generate", url=gen_url, model=model, status=r.status_code, ms=dt, prompt_chars=len(prompt))
+    r = requests.post(chat_url, headers=headers, json=chat_payload, timeout=timeout)
+    dt = round((time.perf_counter() - t0) * 1000.0, 1)
+    _log_stage("openrouter:chat", url=chat_url, model=model, status=r.status_code, ms=dt, prompt_chars=len(prompt))
 
-    if r.status_code == 404 or ("model" in r.text.lower() and "not found" in r.text.lower()):
-        payload_chat = {
+    # If OK, parse and return
+    if r.ok:
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        return _extract_json(content)
+
+    # If clearly "wrong endpoint" for this model or server: fallback to /completions
+    if r.status_code in (404, 405):
+        # ---------- Fallback: legacy /completions ----------
+        comp_url = f"{base}/completions"
+        comp_payload = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "options": {"temperature": 0, "num_ctx": 6144},
-            "stream": False,
+            "prompt": (
+                "You are a careful compliance analyst. Reply with STRICT JSON only.\n\n"
+                + prompt
+            ),
+            "temperature": 0,
         }
         t1 = time.perf_counter()
-        r = requests.post(chat_url, json=payload_chat, timeout=timeout)
-        dt2 = round((time.perf_counter() - t1)*1000.0, 1)
-        _log_stage("ollama:chat", url=chat_url, model=model, status=r.status_code, ms=dt2)
-        r.raise_for_status()
-        resp = r.json().get("message", {}).get("content", "")
-        return _extract_json(resp)
+        r2 = requests.post(comp_url, headers=headers, json=comp_payload, timeout=timeout)
+        dt2 = round((time.perf_counter() - t1) * 1000.0, 1)
+        _log_stage("openrouter:completions", url=comp_url, model=model, status=r2.status_code, ms=dt2)
 
-    r.raise_for_status()
-    resp = r.json().get("response", "")
-    return _extract_json(resp)
+        if r2.ok:
+            data2 = r2.json()
+            text = (data2.get("choices") or [{}])[0].get("text", "")
+            return _extract_json(text)
+
+        # Show server message to help diagnose (model slug, etc.)
+        try:
+            err_text = r2.text
+        except Exception:
+            err_text = "<no body>"
+        raise requests.HTTPError(f"OpenRouter /completions error {r2.status_code}: {err_text}")
+
+    # For other non-OK cases, raise with body so you can see what's wrong
+    try:
+        err_text = r.text
+    except Exception:
+        err_text = "<no body>"
+    raise requests.HTTPError(f"OpenRouter /chat/completions error {r.status_code}: {err_text}")
 
 # ==============================
 # Prompt (page-level)
@@ -308,7 +360,7 @@ def analyze_pages(doc: ExtractedDoc) -> Dict[str, Any]:
             prompt = PAGE_PROMPT % {"page_no": p.page_index, "images_on_page": p.images_on_page, "page_text": page_text}
             with stage("page_llm", page=p.page_index, chars=len(page_text), imgs=p.images_on_page, model=PRIMARY_MODEL):
                 try:
-                    out = call_ollama(prompt, model=PRIMARY_MODEL)
+                    out = call_openrouter(prompt, model=PRIMARY_MODEL)
                 except Exception as e:
                     _log_stage("page_llm:error", page=p.page_index, err=str(e))
                     out = _fallback_page_obj(p)
@@ -349,7 +401,7 @@ INPUT:
 """
     with stage("verify_llm", model=VERIFIER_MODEL):
         try:
-            return call_ollama(prompt, model=VERIFIER_MODEL)
+            return call_openrouter(prompt, model=VERIFIER_MODEL)
         except Exception as e:
             _log_stage("verify_llm:error", err=str(e))
             return {"agree": True, "suggested_final_labels": doc_json.get("final_labels", []), "notes": f"verify_error: {e}"}
@@ -383,7 +435,7 @@ UPLOAD_HTML = r"""
     <header class="mb-6">
       <h1 class="text-2xl font-semibold text-slate-900">AI Document Classifier</h1>
       <p class="text-slate-600">Upload any document (PDF, DOCX, images). Two LLMs cross-verify results and produce audit-grade citations.</p>
-      <p class="text-xs text-slate-500 mt-1">Models: <span class="font-medium">PRIMARY={{primary}}</span> • <span class="font-medium">VERIFIER={{verifier}}</span> • Ollama: <span class="font-medium">{{host}}</span></p>
+      <p class="text-xs text-slate-500 mt-1">Models: <span class="font-medium">PRIMARY={{primary}}</span> • <span class="font-medium">VERIFIER={{verifier}}</span> • Provider: <span class="font-medium">OpenRouter</span></p>
     </header>
 
     <!-- Upload Card -->
@@ -573,7 +625,7 @@ function cardTemplate(item, idx){
               <label class="inline-flex items-center gap-2 text-sm"><input type="checkbox" class="ov" value="Confidential">Confidential</label>
               <label class="inline-flex items-center gap-2 text-sm"><input type="checkbox" class="ov" value="Highly Sensitive">Highly Sensitive</label>
               <label class="inline-flex items-center gap-2 text-sm"><input type="checkbox" class="ov" value="Unsafe">Unsafe</label>
-\            </div>
+            </div>
             <textarea placeholder="Add reviewer notes…" class="mt-3 w-full border rounded-lg p-2 text-sm js-notes" rows="3"></textarea>
             <button class="mt-2 px-3 py-2 rounded-lg border hover:bg-slate-50 js-submit-override">Submit override</button>
           </div>
@@ -723,16 +775,16 @@ def index():
         UPLOAD_HTML,
         primary=PRIMARY_MODEL,
         verifier=VERIFIER_MODEL,
-        host=OLLAMA_HOST,
         ocr_checked=("checked" if ENABLE_OCR else "")
     )
 
 @app.post("/classify")
 def classify():
+    if not OPENROUTER_APIKEY:
+        return jsonify({"ok": False, "error": "Missing OPENROUTER_API_KEY"}), 400
+
     with stage("classify"):
-        # Multi-file first
         files = request.files.getlist("files")
-        # Backward-compat: if only 'file' was sent
         if not files:
             fone = request.files.get("file")
             if fone:
@@ -801,17 +853,35 @@ def classify():
         }
         return jsonify(resp)
 
-# health check
 @app.get("/health")
 def health():
     with stage("health"):
         try:
-            r = requests.get(f"{OLLAMA_HOST}/api/version", timeout=3)
-            ok = r.ok
-            ver = r.json()
+            base = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1").rstrip("/")
+            api_key = os.getenv("OPENROUTER_API_KEY", "")
+            if not api_key:
+                return jsonify({"ok": False, "error": "Missing OPENROUTER_API_KEY"})
+
+            url = f"{base}/models"
+            headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+            r = requests.get(url, headers=headers, timeout=5)
+
+            if not r.ok:
+                return jsonify({"ok": False, "provider": "openrouter", "status": r.status_code, "body": r.text})
+
+            data = r.json()
+            # Optional: verify the configured models exist
+            have_primary  = any(m.get("id") == PRIMARY_MODEL for m in data.get("data", []))
+            have_verifier = any(m.get("id") == VERIFIER_MODEL for m in data.get("data", []))
+            return jsonify({
+                "ok": True,
+                "provider": "openrouter",
+                "models_listed": len(data.get("data", [])),
+                "primary_model_ok": have_primary,
+                "verifier_model_ok": have_verifier
+            })
         except Exception as e:
-            ok, ver = False, {"error": str(e)}
-        return jsonify({"ok": ok, "ollama": ver})
+            return jsonify({"ok": False, "provider": "openrouter", "error": str(e)})
 
 @app.get("/ping")
 def ping():
@@ -845,6 +915,9 @@ def feedback():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
+    # Quick guardrail so you see a helpful message if key is missing
+    if not OPENROUTER_APIKEY:
+        print("WARNING: OPENROUTER_API_KEY is not set. Set it before using /classify.")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
 
 HITL_LOG = os.getenv("HITL_LOG", "hitl_feedback.jsonl")
