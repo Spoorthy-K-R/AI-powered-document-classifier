@@ -1,14 +1,17 @@
-fastapi
-uvicorn
-PyMuPDF
-pytesseract
-opencv-python
-python-multipart
-presidio-analyzer
-presidio-anonymizer
-spacy
-detoxify
-torch
-transformers
-Pillow
-requests
+# Core
+Flask>=3.0,<4
+requests>=2.32,<3
+
+# Document parsing
+pymupdf>=1.24.0,<2      # import name is "fitz"
+Pillow>=10.3,<11        # PIL
+python-docx>=1.1.0,<2
+
+# Optional OCR (enable only if you plan to use OCR)
+pytesseract>=0.3.10,<0.4
+
+# Env file support (optional but handy for OPENROUTER_API_KEY)
+python-dotenv>=1.0.1,<2
+
+# Production server (optional)
+gunicorn>=21.2,<22

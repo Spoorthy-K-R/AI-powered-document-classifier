@@ -42,7 +42,7 @@ HITL_LOG = os.getenv("HITL_LOG", "hitl_feedback.jsonl")
 
 # Optional headers OpenRouter recommends (not required)
 OPENROUTER_SITE   = os.getenv("OPENROUTER_SITE_URL", "")
-OPENROUTER_APP    = os.getenv("OPENROUTER_APP_NAME", "AI Document Classifier")
+OPENROUTER_APP    = os.getenv("OPENROUTER_APP_NAME", "AI-Powered Document Classifier")
 
 # ==============================
 # Logging / request-scoped debug
@@ -113,7 +113,7 @@ def call_openrouter(prompt: str, model: str, timeout: int = 120) -> dict:
         "Content-Type": "application/json",
         # Optional but useful for OpenRouter analytics/rate-limits attribution
         "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "") or "http://localhost",
-        "X-Title": os.getenv("OPENROUTER_APP_NAME", "AI Document Classifier"),
+        "X-Title": os.getenv("OPENROUTER_APP_NAME", "AI-Powered Document Classifier"),
         "Accept": "application/json",
     }
 
@@ -191,6 +191,14 @@ Analyze ONE page for policy signals. Use this exact schema:
     "ssn": [], "credit_card": [], "bank_account": [], "passport_or_dl": [],
     "email": [], "phone": [], "address": [], "person_names": []
   },
+  "pii_summary": {
+    "has_pii": false,
+    "kinds": [],
+    "counts": {
+      "ssn": 0, "credit_card": 0, "bank_account": 0, "passport_or_dl": 0,
+      "email": 0, "phone": 0, "address": 0, "person_names": 0
+    }
+  },
   "unsafe": {
     "child_sexual_content": false,
     "hate_or_identity_attack": false,
@@ -206,11 +214,15 @@ Analyze ONE page for policy signals. Use this exact schema:
 
 Rules:
 - HARD PII: ssn, credit_card, bank_account, passport_or_dl. Return small text snippets and offsets if visible.
-- SOFT PII: email/phone/address/person_names.
+- SOFT PII: email/phone/address/person_names. Presence of SOFT PII alone does NOT make the page internal.
+- Treat obvious public-facing contact details as PUBLIC:
+  • Company office addresses, headquarters locations, front-desk/office phone numbers.  
+  • Business emails/phones for sales/support/press (e.g., info@, sales@, support@, press@, careers@, or named employees at the company domain like jane.doe@company.com when shown as a contact on a brochure, flyer, website snippet, job ad, or similar).  
+- Marketing or services material is PUBLIC, not internal: brochures, product/service descriptions, one-pagers, datasheets, press releases, public event flyers, “About Us / Contact Us” sections.
+- Mark internal_business_only.is_internal = true ONLY for non-public operational content: SOPs, internal memos, roadmaps, non-public schedules, draft contracts, pricing not meant for public, internal org charts, employee directories with private/home contact info, etc.
 - child_sexual_content true ONLY if sexual terms appear near minors/children/teens.
 - cyber_threat_or_instructions true if step-by-step exploit/malware guidance (news/advisory alone is false).
-- internal_business_only true for memos, SOPs, schedules, non-public ops.
-- If uncertain, prefer false. Keep arrays short.
+- If uncertain, prefer false. Keep arrays short. Use 'notes' to explain your decision briefly.
 
 PAGE_TEXT:
 \"\"\"%(page_text)s\"\"\"
@@ -313,27 +325,36 @@ def post_validate(decisions: List[dict]) -> List[dict]:
 def aggregate(decisions: List[dict]) -> Dict[str, Any]:
     decisions = post_validate(decisions)
 
-    def unsafe(d: dict) -> bool: return any(bool(v) for v in d.get("unsafe", {}).values())
-    def hard(d: dict) -> bool:
-        pii = d.get("pii", {})
-        return any(pii.get(k) for k in HARD_PII_KEYS)
-    def internal(d: dict) -> bool:
-        return d.get("internal_business_only", {}).get("is_internal", False)
+    def any_unsafe(docs): 
+        return any(any(bool(v) for v in d.get("unsafe", {}).values()) for d in docs)
 
-    has_unsafe   = any(unsafe(d) for d in decisions)
-    has_hard_pii = any(hard(d) for d in decisions)
-    has_internal = any(internal(d) for d in decisions)
+    def any_hard_pii(docs):
+        for d in docs:
+            pii = d.get("pii", {}) or {}
+            if any(pii.get(k) for k in HARD_PII_KEYS):
+                return True
+        return False
 
-    labels=[]
-    if has_unsafe: labels.append("Unsafe")
-    if has_hard_pii: labels.append("Highly Sensitive")
-    elif has_internal: labels.append("Confidential")
-    else: labels.append("Public")
+    def any_internal(docs):
+        return any(d.get("internal_business_only", {}).get("is_internal", False) for d in docs)
 
-    confidence = 0.50 + (0.25 if "Unsafe" in labels else 0) + (0.15 if any(x in labels for x in ("Highly Sensitive","Confidential")) else 0)
+    # Single-label precedence
+    if any_unsafe(decisions):
+        final = "Unsafe"
+        confidence = 0.90
+    elif any_hard_pii(decisions):
+        final = "Highly Sensitive"
+        confidence = 0.80
+    elif any_internal(decisions):
+        final = "Confidential"
+        confidence = 0.70
+    else:
+        final = "Public"
+        confidence = 0.60
+
     return {
-        "final_labels": labels,
-        "confidence": round(min(confidence,0.99),2),
+        "final_labels": [final],          
+        "confidence": round(min(confidence, 0.99), 2),
         "evidence": decisions
     }
 
@@ -349,6 +370,29 @@ def _fallback_page_obj(p: PageItem) -> dict:
         "internal_business_only": {"is_internal": False, "evidence": []},
         "notes": "fallback"
     }
+
+def redact_for_client(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy with all PII values removed, leaving only counts."""
+    red = json.loads(json.dumps(result))  # deep copy
+
+    # Strip PII values to counts
+    for p in red.get("evidence", []) or []:
+        pii = p.get("pii", {})
+        if isinstance(pii, dict):
+            for k, vals in list(pii.items()):
+                count = len(vals) if isinstance(vals, list) else (vals.get("count", 0) if isinstance(vals, dict) else 0)
+                pii[k] = {"count": int(count)}
+        # (optional) trim notes if you worry notes might echo snippets
+        if isinstance(p.get("notes"), str):
+            p["notes"] = p["notes"][:400]
+
+    # Remove any text snippets in citations (if you add them later)
+    for c in red.get("citations", []) or []:
+        c.pop("snippet", None)
+
+    # Never ship debug traces/prompts
+    red.pop("debug", None)
+    return red
 
 def analyze_pages(doc: ExtractedDoc) -> Dict[str, Any]:
     page_results=[]
@@ -383,16 +427,20 @@ def verify_with_second_llm(doc_json: Dict[str,Any]) -> Dict[str,Any]:
     prompt = f"""
 You are auditing a classification. Output STRICT JSON.
 
-Given this JSON, decide if final_labels follow rules:
-- If any page hard PII (ssn, credit_card, bank_account, passport_or_dl) -> include "Highly Sensitive".
-- If any unsafe.* true -> include "Unsafe".
-- If only internal_business_only true and no hard PII -> "Confidential".
-- Else -> "Public".
+Pick exactly ONE final label for the WHOLE document using this precedence:
+1) "Unsafe" if ANY page has an unsafe flag true.
+2) Else "Highly Sensitive" if ANY page has hard PII (ssn, credit_card, bank_account, passport_or_dl).
+3) Else "Confidential" if ANY page is internal_business_only.is_internal = true.
+4) Else "Public".
+
+CRITICAL:
+- Return exactly ONE label (not per-page), in a one-element array.
+- Allowed values: "Public", "Confidential", "Highly Sensitive", "Unsafe".
 
 Return:
 {{
   "agree": true/false,
-  "suggested_final_labels": ["..."],
+  "suggested_final_labels": ["Public" | "Confidential" | "Highly Sensitive" | "Unsafe"],
   "notes": "one short sentence"
 }}
 
@@ -404,7 +452,11 @@ INPUT:
             return call_openrouter(prompt, model=VERIFIER_MODEL)
         except Exception as e:
             _log_stage("verify_llm:error", err=str(e))
-            return {"agree": True, "suggested_final_labels": doc_json.get("final_labels", []), "notes": f"verify_error: {e}"}
+            return {
+                "agree": True,
+                "suggested_final_labels": doc_json.get("final_labels", []),
+                "notes": f"verify_error: {e}"
+            }
 
 # ==============================
 # Flask app
@@ -417,7 +469,7 @@ UPLOAD_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AI Document Classifier</title>
+  <title>AI-Powered Regulatory Document Classifier </title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     .badge { @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium; }
@@ -433,7 +485,7 @@ UPLOAD_HTML = r"""
 <body class="bg-slate-50">
   <div class="max-w-6xl mx-auto p-6">
     <header class="mb-6">
-      <h1 class="text-2xl font-semibold text-slate-900">AI Document Classifier</h1>
+      <h1 class="text-2xl font-semibold text-slate-900">AI-Powered Document Classifier</h1>
       <p class="text-slate-600">Upload any document (PDF, DOCX, images). Two LLMs cross-verify results and produce audit-grade citations.</p>
       <p class="text-xs text-slate-500 mt-1">Models: <span class="font-medium">PRIMARY={{primary}}</span> • <span class="font-medium">VERIFIER={{verifier}}</span> • Provider: <span class="font-medium">OpenRouter</span></p>
     </header>
@@ -554,12 +606,21 @@ function renderEvidence(pagesArr){
   if (!pagesArr || !pagesArr.length) return '<div class="text-sm text-slate-500">No page evidence.</div>';
   return pagesArr.map(p => {
     const piiList = Object.entries(p.pii || {}).map(([k,vals]) => {
-      if (!vals || !vals.length) return '';
-      const short = vals.map(v => (v.text || String(v))).slice(0,3).join(' • ');
-      return `<div><span class="text-xs font-medium text-slate-600">${k}</span>: <span class="text-xs text-slate-700 truncate-2">${short}</span></div>`;
+      let count = 0;
+      if (Array.isArray(vals)) count = vals.length;
+      else if (vals && typeof vals.count === 'number') count = vals.count;
+      return count > 0
+        ? `<div><span class="text-xs font-medium text-slate-600">${k}</span>: <span class="text-xs text-slate-700">${count} found</span></div>`
+        : '';
     }).join('');
-    const unsafeFlags = Object.entries(p.unsafe || {}).filter(([k,v]) => !!v).map(([k]) => `<span class="badge badge-unsafe">${k}</span>`).join(' ');
-    const internal = (p.internal_business_only && p.internal_business_only.is_internal) ? '<span class="badge badge-confidential">internal</span>' : '';
+
+    const unsafeFlags = Object.entries(p.unsafe || {})
+      .filter(([_,v]) => !!v)
+      .map(([k]) => `<span class="badge badge-unsafe">${k}</span>`).join(' ');
+
+    const internal = (p.internal_business_only && p.internal_business_only.is_internal)
+      ? '<span class="badge badge-confidential">internal</span>' : '';
+
     return `
       <details class="border rounded-lg p-3">
         <summary class="cursor-pointer flex items-center justify-between">
@@ -568,7 +629,7 @@ function renderEvidence(pagesArr){
         </summary>
         <div class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-3">
           <div>
-            <div class="text-xs text-slate-500 mb-1">PII</div>
+            <div class="text-xs text-slate-500 mb-1">PII (counts only)</div>
             <div class="space-y-1">${piiList || '<span class="text-xs text-slate-400">none</span>'}</div>
           </div>
           <div>
@@ -639,10 +700,8 @@ function cardTemplate(item, idx){
       </div>
 
       <div class="col-span-2">
-        <h3 class="text-sm font-semibold text-slate-800 mb-2">Citations</h3>
-        <div class="space-y-2 js-citations">${renderCitations(item.citations || [])}</div>
 
-        <h3 class="text-sm font-semibold text-slate-800 mt-5 mb-2">Evidence (page-level)</h3>
+        <h3 class="text-sm font-semibold text-slate-800 mt-5 mb-2">Citations and Evidence (page-level)</h3>
         <div class="space-y-2 js-evidence">${renderEvidence(item.evidence || [])}</div>
 
         <pre class="mono text-xs bg-slate-900 text-slate-100 p-3 rounded-lg mt-4 hidden overflow-auto js-raw">${JSON.stringify(item, null, 2)}</pre>
@@ -814,26 +873,44 @@ def classify():
                     result = analyze_pages(extracted)
 
                 if verify:
-                    with stage("verify_total"):
-                        audit = verify_with_second_llm(result)
-                        suggested = set(audit.get("suggested_final_labels", []))
-                        actual    = set(result.get("final_labels", []))
-                        agree = bool(audit.get("agree", True)) and (suggested.issubset(actual) or actual.issubset(suggested))
-                        if not agree:
-                            audit["agree"] = False
-                            audit.setdefault("notes", "")
-                            if "auto-detected mismatch between models" not in audit["notes"]:
-                                audit["notes"] += (" | " if audit["notes"] else "") + "auto-detected mismatch between models"
-                            result["final_labels"] = list(dict.fromkeys(list(suggested) + ["HITL"]))
-                        result["verifier"] = audit
+                  with stage("verify_total"):
+                      audit = verify_with_second_llm(result)
 
-                result["req_id"]       = per_req_id
-                result["filename"]     = f.filename
-                result["doc_kind"]     = extracted.kind
-                result["page_count"]   = extracted.page_count
-                result["image_count"]  = extracted.image_count
-                result["debug"]        = g.stage_logs
-                batch_results.append(result)
+                      # Expect exactly one label from verifier; fall back to model's if missing.
+                      suggested_list = audit.get("suggested_final_labels") or []
+                      suggested = suggested_list[0] if suggested_list else None
+
+                      actual_list = result.get("final_labels") or []
+                      actual = actual_list[0] if actual_list else None
+
+                      agree = (suggested is None) or (suggested == actual)
+                      if not agree and suggested:
+                          audit["agree"] = False
+                          audit.setdefault("notes", "")
+                          if "auto-detected mismatch between models" not in audit["notes"]:
+                              audit["notes"] += (" | " if audit["notes"] else "") + "auto-detected mismatch between models"
+
+                          # Adopt verifier's single overall label; optionally tag HITL for visibility.
+                          result["final_labels"] = [suggested, "HITL"]
+                      else:
+                          # Ensure we only ever keep a single overall label (no duplicates)
+                          result["final_labels"] = [actual or suggested or "Public"]
+
+                      result["verifier"] = audit
+
+                # ... inside the for-file loop, after building `result`
+                public_result = redact_for_client(result)
+                # Ensure the public copy still carries the meta you need
+                public_result["req_id"]      = per_req_id
+                public_result["filename"]    = f.filename
+                public_result["doc_kind"]    = extracted.kind
+                public_result["page_count"]  = extracted.page_count
+                public_result["image_count"] = extracted.image_count
+                public_result["debug"]        = g.stage_logs
+
+                batch_results.append(public_result)
+                
+                
             except Exception as e:
                 _log_stage("file:error", filename=getattr(f, "filename", "?"), err=str(e))
                 batch_results.append({
