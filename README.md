@@ -1,6 +1,7 @@
 # PDF Processing and Document Analysis API with FastAPI
 
 This application provides an API to process PDF files, extract text, perform OCR, calculate a legibility score, and classify documents using an LLM.
+Deployed on Heroku - https://ai-powered-doc-classifier-59728d598ae1.herokuapp.com/
 
 ## Technologies Used
 
@@ -16,7 +17,6 @@ This application provides an API to process PDF files, extract text, perform OCR
 1.  **Prerequisites:**
     *   Python 3.7+
     *   Tesseract OCR engine. You can download it from [https://github.com/tesseract-ocr/tesseract](https://github.com/tesseract-ocr/tesseract). Make sure to add the Tesseract executable to your system's PATH.
-    *   Ollama: Install Ollama from [https://ollama.com/](https://ollama.com/) and ensure it is running.
 
 2.  **Clone the repository (or download the files):**
     ```bash
@@ -42,22 +42,11 @@ This application provides an API to process PDF files, extract text, perform OCR
     ollama pull mistral:7b-instruct
     ```
 
-## How to Run the Application
-
-1.  **Start the Ollama server:**
-    Ensure Ollama is running in the background.
-
-2.  **Start the FastAPI server:**
-    ```bash
-    uvicorn main:app --reload
-    ```
-
-3.  **Access the API documentation:**
-    Open your browser and navigate to `http://127.0.0.1:8001/docs`. You will see the Swagger UI, which allows you to interact with the API.
+Open your browser and navigate to `http://127.0.0.1:8001/docs`. You will see the Swagger UI, which allows you to interact with the API.
 
 ## API Endpoint
 
-### `POST /process_pdf/`
+### `POST /classify/`
 
 -   **Description:** Upload a PDF file to be processed and classified.
 -   **Request:**
