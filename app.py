@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os, io, re, json, time, logging, uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
